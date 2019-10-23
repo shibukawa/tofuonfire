@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"flag"
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/fatih/color"
@@ -19,10 +20,14 @@ import (
 )
 
 func main() {
-	if len(os.Args) == 1 {
+	additional := flag.String("additional", "", "additional-json")
+	flag.Parse()
+
+	if len(flag.Args()) == 1 {
 		fmt.Printf("%s [event number]\n", os.Args[0])
 	}
-	eventNumber := os.Args[1]
+
+	eventNumber := flag.Arg(0)
 
 	os.MkdirAll("output/cache", 0755)
 	os.MkdirAll("output/pages", 0755)
@@ -43,6 +48,20 @@ func main() {
 	}
 	if err != nil {
 		panic(err)
+	}
+	if *additional != "" {
+		addFile, err := os.Open(*additional)
+		if err != nil {
+			panic(err)
+		}
+		defer addFile.Close()
+		extraFiles := &Cache{}
+		dec := json.NewDecoder(addFile)
+		err = dec.Decode(extraFiles)
+		if err != nil {
+			panic(err)
+		}
+		cache.Pages = append(cache.Pages, extraFiles.Pages...)
 	}
 	for _, page := range cache.Pages {
 		fileName := strings.ReplaceAll(page.Category, " ", "")
@@ -68,29 +87,7 @@ func readConnpass(eventNumber string) (*Cache, error) {
 	var cache Cache
 	cache.EventName = doc.Find(".event_title").Text()
 
-	doc.Find("table.participants_table").Each(func(index int, s *goquery.Selection) {
-		title := spaces.ReplaceAllString(s.Find("thead tr th").Text(), " ")
-		color.Green(title)
-		page := Page{
-			Category: title,
-		}
-		s.Find(".display_name > a").Each(func(index int, s *goquery.Selection) {
-			href, _ := s.Attr("href")
-			fragments := strings.Split(href, "/")
-			name := fragments[len(fragments)-2]
-			if name == "open" {
-				name = fragments[len(fragments)-3]
-			}
-			color.Cyan(s.Text() + " (" + href + ")")
-			imagepath := downloadImage(name, href, limiter)
-			user := Card{
-				Name:      s.Text(),
-				ImagePath: imagepath,
-			}
-			page.Cards = append(page.Cards, user)
-		})
-		cache.Pages = append(cache.Pages, page)
-	})
+	doc.Find("table.participants_table").Each(parseTable(spaces, limiter, &cache))
 	jsonFilePath := fmt.Sprintf("output/cache/%s.json", eventNumber)
 	cacheFile, err := os.Create(jsonFilePath)
 	if err != nil {
@@ -100,6 +97,69 @@ func readConnpass(eventNumber string) (*Cache, error) {
 	encoder := json.NewEncoder(cacheFile)
 	encoder.Encode(&cache)
 	return &cache, nil
+}
+
+func parseTable(spaces *regexp.Regexp, limiter *rate.Limiter, cache *Cache) func(index int, s *goquery.Selection) {
+	return func(index int, s *goquery.Selection) {
+		title := spaces.ReplaceAllString(s.Find("thead tr th").Text(), " ")
+		color.Green(title)
+		page := Page{
+			Category: title,
+		}
+		s.Find(".display_name > a").Each(parseMember(limiter, &page))
+		more := s.Find("tbody tr.empty")
+		if len(more.Nodes) > 0 {
+			link, ok := more.Find("a").Attr("href")
+			if ok {
+				res, err := http.Get(link)
+				if err != nil {
+					log.Fatalln(err)
+				}
+				doc, err := goquery.NewDocumentFromReader(res.Body)
+				if err != nil {
+					log.Fatalln(err)
+				}
+				var queries []string
+				doc.Find(".paging_area a").Each(func(index int, s *goquery.Selection) {
+					if href, ok := s.Attr("href"); ok {
+						if index == 0 || queries[len(queries)-1] != href {
+							queries = append(queries, href)
+						}
+					}
+				})
+				for _, query := range queries {
+					res, err := http.Get(link + query)
+					if err != nil {
+						log.Fatalln(err)
+					}
+					doc, err := goquery.NewDocumentFromReader(res.Body)
+					if err != nil {
+						log.Fatalln(err)
+					}
+					doc.Find(".display_name > a").Each(parseMember(limiter, &page))
+				}
+			}
+		}
+		cache.Pages = append(cache.Pages, page)
+	}
+}
+
+func parseMember(limiter *rate.Limiter, page *Page) func(index int, s *goquery.Selection) {
+	return func(index int, s *goquery.Selection) {
+		href, _ := s.Attr("href")
+		fragments := strings.Split(href, "/")
+		name := fragments[len(fragments)-2]
+		if name == "open" {
+			name = fragments[len(fragments)-3]
+		}
+		color.Cyan(s.Text() + " (" + href + ")")
+		imagepath := downloadImage(name, href, limiter)
+		user := Card{
+			Name:      s.Text(),
+			ImagePath: imagepath,
+		}
+		page.Cards = append(page.Cards, user)
+	}
 }
 
 func downloadImage(name string, href string, limiter *rate.Limiter) string {
